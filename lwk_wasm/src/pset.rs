@@ -287,6 +287,41 @@ impl PsetInputBuilder {
         self
     }
 
+    /// Add a BIP32 derivation entry for signing this input.
+    ///
+    /// `bip32_derivation` is a map from public key to (master fingerprint,
+    /// derivation path). The LWK software signer (and external signers /
+    /// hardware wallets) iterate this map per input to find which keys to sign
+    /// with and which paths to derive.
+    ///
+    /// Each call inserts one entry; for multi-sig inputs, call this once per
+    /// cosigner. Calling with the same `pubkey` overwrites the previous entry.
+    ///
+    /// `fingerprint_hex` is the 4-byte master fingerprint as hex (e.g. "deadbeef").
+    /// `derivation_path` is the canonical path, e.g. "m/84'/1'/0'/0/0".
+    #[wasm_bindgen(js_name = bip32Derivation)]
+    pub fn bip32_derivation(
+        mut self,
+        pubkey: &PublicKey,
+        fingerprint_hex: &str,
+        derivation_path: &str,
+    ) -> Result<PsetInputBuilder, Error> {
+        use lwk_wollet::elements::bitcoin::bip32::{DerivationPath, Fingerprint};
+        use lwk_wollet::hashes::hex::FromHex;
+        use std::str::FromStr;
+
+        let fp_bytes = Vec::<u8>::from_hex(fingerprint_hex)?;
+        let fp_array: [u8; 4] = fp_bytes.as_slice().try_into()?;
+        let fp = Fingerprint::from(fp_array);
+
+        let path = DerivationPath::from_str(derivation_path)?;
+
+        self.inner
+            .bip32_derivation
+            .insert(pubkey.into(), (fp, path));
+        Ok(self)
+    }
+
     /// Build the PsetInput, consuming the builder.
     pub fn build(self) -> PsetInput {
         PsetInput::from(self.inner)
@@ -563,5 +598,80 @@ mod tests {
             pset.inner().global.tx_data.fallback_locktime,
             Some(lwk_wollet::elements::LockTime::from_consensus(100))
         );
+    }
+
+    #[cfg(feature = "simplicity")]
+    #[wasm_bindgen_test]
+    fn pset_input_builder_bip32_derivation() {
+        use std::str::FromStr;
+
+        let txid =
+            Txid::new("0000000000000000000000000000000000000000000000000000000000000001").unwrap();
+        let outpoint = OutPoint::from_parts(&txid, 0);
+
+        // 33-byte secp256k1 generator point — valid compressed pubkey.
+        let pubkey = PublicKey::from_string(
+            "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+        )
+        .unwrap();
+        let fingerprint_hex = "deadbeef";
+        let path_str = "m/84'/1'/0'/0/0";
+
+        // Inserted entry round-trips: pubkey is the map key, fingerprint and
+        // derivation path are the value.
+        let input = PsetInputBuilder::from_prevout(&outpoint)
+            .bip32_derivation(&pubkey, fingerprint_hex, path_str)
+            .unwrap()
+            .build();
+        let map = &input.inner().bip32_derivation;
+        assert_eq!(map.len(), 1);
+        let inner_pk: lwk_wollet::elements::bitcoin::PublicKey = (&pubkey).into();
+        let (fp, path) = map.get(&inner_pk).expect("entry present under pubkey");
+        assert_eq!(
+            *fp,
+            lwk_wollet::elements::bitcoin::bip32::Fingerprint::from([0xde, 0xad, 0xbe, 0xef,])
+        );
+        assert_eq!(
+            *path,
+            lwk_wollet::elements::bitcoin::bip32::DerivationPath::from_str(path_str).unwrap()
+        );
+
+        // Multiple distinct pubkeys accumulate in the map.
+        let pubkey2 = PublicKey::from_string(
+            "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
+        )
+        .unwrap();
+        let multi = PsetInputBuilder::from_prevout(&outpoint)
+            .bip32_derivation(&pubkey, fingerprint_hex, path_str)
+            .unwrap()
+            .bip32_derivation(&pubkey2, fingerprint_hex, "m/0/1")
+            .unwrap()
+            .build();
+        assert_eq!(multi.inner().bip32_derivation.len(), 2);
+
+        // Same pubkey twice overwrites; the latest value wins.
+        let overwritten = PsetInputBuilder::from_prevout(&outpoint)
+            .bip32_derivation(&pubkey, fingerprint_hex, "m/0/0")
+            .unwrap()
+            .bip32_derivation(&pubkey, fingerprint_hex, "m/0/1")
+            .unwrap()
+            .build();
+        let overwritten_map = &overwritten.inner().bip32_derivation;
+        assert_eq!(overwritten_map.len(), 1);
+        let (_, latest_path) = overwritten_map.get(&inner_pk).expect("entry present");
+        assert_eq!(
+            *latest_path,
+            lwk_wollet::elements::bitcoin::bip32::DerivationPath::from_str("m/0/1").unwrap()
+        );
+
+        // Wrong fingerprint length.
+        assert!(PsetInputBuilder::from_prevout(&outpoint)
+            .bip32_derivation(&pubkey, "deadbe", "m/0/0")
+            .is_err());
+
+        // Malformed path.
+        assert!(PsetInputBuilder::from_prevout(&outpoint)
+            .bip32_derivation(&pubkey, fingerprint_hex, "not-a-path")
+            .is_err());
     }
 }
