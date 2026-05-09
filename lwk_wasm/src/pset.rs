@@ -287,6 +287,40 @@ impl PsetInputBuilder {
         self
     }
 
+    /// Set the explicit amount of the input UTXO (`PSET_IN_EXPLICIT_VALUE`).
+    ///
+    /// Required by BIP-371 strict verifiers and hardware signers. For
+    /// amount-to-commitment binding, `blind_value_proof` is also required
+    /// (not exposed here).
+    #[wasm_bindgen(js_name = explicitAmount)]
+    pub fn explicit_amount(mut self, amount: u64) -> PsetInputBuilder {
+        self.inner.amount = Some(amount);
+        self
+    }
+
+    /// Set the explicit asset ID of the input UTXO (`PSET_IN_EXPLICIT_ASSET`).
+    ///
+    /// Required by BIP-371 strict verifiers and hardware signers. For
+    /// asset-to-commitment binding, `blind_asset_proof` is also required
+    /// (not exposed here).
+    #[wasm_bindgen(js_name = explicitAsset)]
+    pub fn explicit_asset(mut self, asset: &AssetId) -> PsetInputBuilder {
+        self.inner.asset = Some((*asset).into());
+        self
+    }
+
+    /// Set the input UTXO rangeproof (`PSET_IN_UTXO_RANGEPROOF`).
+    ///
+    /// The rangeproof from the prior transaction's output — proves the value
+    /// commitment is well-formed (committed value lies in `[0, 2^52]`).
+    /// Orthogonal to amount-to-commitment binding (see `blind_value_proof`).
+    #[wasm_bindgen(js_name = inUtxoRangeproof)]
+    pub fn in_utxo_rangeproof(mut self, rangeproof: &[u8]) -> Result<PsetInputBuilder, Error> {
+        let rp = lwk_wollet::elements::secp256k1_zkp::RangeProof::from_slice(rangeproof)?;
+        self.inner.in_utxo_rangeproof = Some(Box::new(rp));
+        Ok(self)
+    }
+
     /// Build the PsetInput, consuming the builder.
     pub fn build(self) -> PsetInput {
         PsetInput::from(self.inner)
@@ -563,5 +597,51 @@ mod tests {
             pset.inner().global.tx_data.fallback_locktime,
             Some(lwk_wollet::elements::LockTime::from_consensus(100))
         );
+    }
+
+    #[cfg(feature = "simplicity")]
+    #[wasm_bindgen_test]
+    fn pset_input_builder_explicit_and_rangeproof() {
+        let txid =
+            Txid::new("0000000000000000000000000000000000000000000000000000000000000001").unwrap();
+        let outpoint = OutPoint::from_parts(&txid, 0);
+        let asset = AssetId::from_string(
+            "6f0279e9ed041c3d710a9f57d0c02928416460c4b722ae3457a11eec381c526d",
+        )
+        .unwrap();
+
+        // Explicit fields round-trip through the inner Input.
+        let input = PsetInputBuilder::from_prevout(&outpoint)
+            .explicit_amount(12_345)
+            .explicit_asset(&asset)
+            .build();
+        let inner = input.inner();
+        assert_eq!(inner.amount, Some(12_345));
+        let inner_asset: lwk_wollet::elements::AssetId = inner.asset.unwrap();
+        let expected_asset: lwk_wollet::elements::AssetId = asset.into();
+        assert_eq!(inner_asset, expected_asset);
+
+        // Malformed rangeproof bytes are rejected.
+        assert!(PsetInputBuilder::from_prevout(&outpoint)
+            .in_utxo_rangeproof(&[0u8; 4])
+            .is_err());
+
+        // Happy path: a real rangeproof from the existing fixture transaction
+        // is accepted and stored.
+        let tx_hex =
+            include_str!("../../lwk_jade/test_data/pset_to_be_signed_transaction.hex").trim_end();
+        let tx = Transaction::new(tx_hex).unwrap();
+        let tx_ref: &lwk_wollet::elements::Transaction = tx.as_ref();
+        let rp_bytes = tx_ref.output[0]
+            .witness
+            .rangeproof
+            .as_ref()
+            .expect("first fixture output is confidential")
+            .serialize();
+        let with_rp = PsetInputBuilder::from_prevout(&outpoint)
+            .in_utxo_rangeproof(&rp_bytes)
+            .unwrap()
+            .build();
+        assert!(with_rp.inner().in_utxo_rangeproof.is_some());
     }
 }
